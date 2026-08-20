@@ -2,8 +2,12 @@ import { NextResponse } from "next/server";
 import { supabaseAdmin } from "../../../lib/supabaseAdmin";
 
 // ESPN's public (unofficial, no API key needed) endpoint for a team's schedule.
-const ESPN_URL =
-  "https://site.api.espn.com/apis/site/v2/sports/football/nfl/teams/ne/schedule?season=2026";
+// seasontype: 1 = preseason, 2 = regular season, 3 = postseason.
+// We fetch all three so the full season shows up, not just whatever ESPN
+// treats as "current" (which defaults to preseason in August).
+function espnUrl(seasontype) {
+  return `https://site.api.espn.com/apis/site/v2/sports/football/nfl/teams/ne/schedule?season=2026&seasontype=${seasontype}`;
+}
 
 // A simple shared secret so random people on the internet can't spam this
 // endpoint. Set CRON_SECRET in Vercel and pass ?secret=... when you set up
@@ -22,9 +26,10 @@ export async function GET(request) {
 
   let events = [];
   try {
-    const res = await fetch(ESPN_URL, { cache: "no-store" });
-    const data = await res.json();
-    events = data.events || [];
+    const results = await Promise.all(
+      [1, 2, 3].map((seasontype) => fetch(espnUrl(seasontype), { cache: "no-store" }).then((r) => r.json()))
+    );
+    events = results.flatMap((data) => data.events || []);
   } catch (err) {
     return NextResponse.json({ error: "failed to fetch ESPN data", detail: String(err) }, { status: 502 });
   }
@@ -93,3 +98,9 @@ export async function GET(request) {
 
   return NextResponse.json(summary);
 }
+
+After committing, Vercel will auto-redeploy in a minute or two. Then visit https://YOUR-SITE.vercel.app/api/grade-games?secret=YOUR_CRON_SECRET once yourself to trigger an immediate sync — you should see a bigger "synced" number this time, and regular season games should appear on your homepage.
+
+One thing worth deciding: do you want preseason games to keep showing on the site alongside regular season, or would you rather I make it only show regular season + playoffs (since preseason results don't matter much for most fans)?
+
+
