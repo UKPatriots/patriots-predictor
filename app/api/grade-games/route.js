@@ -1,20 +1,24 @@
 import { NextResponse } from "next/server";
 import { supabaseAdmin } from "../../../lib/supabaseAdmin";
 
-// ESPN's public (unofficial, no API key needed) endpoint for a team's schedule.
+// ESPN's public (unofficial, no API key needed) scoreboard endpoint, per week.
 // seasontype: 1 = preseason, 2 = regular season, 3 = postseason.
-// We fetch all three so the full season shows up, not just whatever ESPN
-// treats as "current" (which defaults to preseason in August).
-function espnUrl(seasontype) {
-  return `https://site.api.espn.com/apis/site/v2/sports/football/nfl/teams/ne/schedule?season=2026&seasontype=${seasontype}`;
+// The team-schedule endpoint doesn't reliably support filtering by season
+// type, so instead we pull each week's full scoreboard and pick out
+// whichever game the Patriots played, if any.
+function scoreboardUrl(seasontype, week) {
+  return `https://site.api.espn.com/apis/site/v2/sports/football/nfl/scoreboard?dates=2026&seasontype=${seasontype}&week=${week}`;
 }
 
-// A simple shared secret so random people on the internet can't spam this
-// endpoint. Set CRON_SECRET in Vercel and pass ?secret=... when you set up
-// the scheduler.
+const WEEKS_TO_CHECK = [
+  ...[1, 2, 3, 4].map((week) => ({ seasontype: 1, week })), // preseason
+  ...Array.from({ length: 18 }, (_, i) => ({ seasontype: 2, week: i + 1 })), // regular season
+  ...[1, 2, 3, 4, 5].map((week) => ({ seasontype: 3, week })), // postseason
+];
+
 function isAuthorized(request) {
   const secret = process.env.CRON_SECRET;
-  if (!secret) return true; // allow if you haven't set one yet (fine for testing)
+  if (!secret) return true;
   const url = new URL(request.url);
   return url.searchParams.get("secret") === secret;
 }
@@ -24,17 +28,26 @@ export async function GET(request) {
     return NextResponse.json({ error: "unauthorized" }, { status: 401 });
   }
 
-  let events = [];
-  try {
-    const results = await Promise.all(
-      [1, 2, 3].map((seasontype) => fetch(espnUrl(seasontype), { cache: "no-store" }).then((r) => r.json()))
-    );
-    events = results.flatMap((data) => data.events || []);
-  } catch (err) {
-    return NextResponse.json({ error: "failed to fetch ESPN data", detail: String(err) }, { status: 502 });
-  }
+  const events = [];
+  const fetchErrors = [];
 
-  const summary = { synced: 0, newlyGraded: [] };
+  await Promise.all(
+    WEEKS_TO_CHECK.map(async ({ seasontype, week }) => {
+      try {
+        const res = await fetch(scoreboardUrl(seasontype, week), { cache: "no-store" });
+        const data = await res.json();
+        for (const event of data.events || []) {
+          const competitors = event.competitions?.[0]?.competitors || [];
+          const hasPatriots = competitors.some((c) => c.team?.abbreviation === "NE");
+          if (hasPatriots) events.push(event);
+        }
+      } catch (err) {
+        fetchErrors.push(`seasontype ${seasontype} week ${week}: ${String(err)}`);
+      }
+    })
+  );
+
+  const summary = { synced: 0, newlyGraded: [], fetchErrors };
 
   for (const event of events) {
     const competition = event.competitions?.[0];
@@ -67,7 +80,6 @@ export async function GET(request) {
       winner,
     };
 
-    // Check if this game was already marked final before this run
     const { data: existing } = await supabaseAdmin
       .from("games")
       .select("status")
@@ -79,7 +91,6 @@ export async function GET(request) {
     await supabaseAdmin.from("games").upsert(gameRow);
     summary.synced += 1;
 
-    // Grade picks only the moment a game newly becomes final
     if (isFinal && !wasAlreadyFinal && winner) {
       const { data: picks } = await supabaseAdmin
         .from("picks")
@@ -98,9 +109,3 @@ export async function GET(request) {
 
   return NextResponse.json(summary);
 }
-
-After committing, Vercel will auto-redeploy in a minute or two. Then visit https://YOUR-SITE.vercel.app/api/grade-games?secret=YOUR_CRON_SECRET once yourself to trigger an immediate sync — you should see a bigger "synced" number this time, and regular season games should appear on your homepage.
-
-One thing worth deciding: do you want preseason games to keep showing on the site alongside regular season, or would you rather I make it only show regular season + playoffs (since preseason results don't matter much for most fans)?
-
-
